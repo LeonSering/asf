@@ -1,0 +1,25 @@
+[package]
+name = "asf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Agent Session Finder - search, browse and resume your past Claude Code conversations in a terminal UI"
+authors = ["Leon Sering <leon@sering.eu>"]
+license = "MIT"
+repository = "https://github.com/LeonSering/asf"
+readme = "README.md"
+keywords = ["claude", "tui", "sessions", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+aho-corasick = "1"
+crossterm = "0.28"
+dirs = "6"
+libc = "0.2"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
