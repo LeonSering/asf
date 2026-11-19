@@ -44,6 +44,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new(sessions, ignored);
     app.open_label = config.open_label.clone();
     app.alt_label = config.alt_open.as_ref().map(|_| config.alt_label.clone());
+    app.stop_template = Some(config.stop.clone());
 
     loop {
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -64,7 +65,12 @@ fn main() -> io::Result<()> {
     terminal.show_cursor()?;
 
     let opened = app.open_session.and_then(|(session, mode)| {
-        let cmd = config.command(mode == OpenMode::Alt, &session.session_id, &session.cwd)?;
+        let which = match mode {
+            OpenMode::Primary => config::Which::Open,
+            OpenMode::Alt => config::Which::Alt,
+            OpenMode::Attach => config::Which::Attach,
+        };
+        let cmd = config.command(which, &session.session_id, &session.cwd)?;
         Some((session.cwd, cmd))
     });
 

@@ -10,10 +10,17 @@
 //! # Alt-v, disabled unless set
 //! alt_open = claude --resume {id} --model opus
 //! alt_label = opus
+//!
+//! # Enter on a session running in the background (`claude --bg`)
+//! attach = claude attach {short_id}
+//!
+//! # Alt-s: stop a session running in the background
+//! stop = claude stop {short_id}
 //! ```
 //!
-//! `{id}` is replaced by the session id and `{cwd}` by the session folder,
-//! both shell-quoted. The command runs through the shell in the session
+//! `{id}` is replaced by the session id, `{short_id}` by its first 8
+//! characters (what `claude attach` expects) and `{cwd}` by the session
+//! folder, all shell-quoted. The command runs through the shell in the session
 //! folder, so `~` and environment variables work.
 
 use std::path::PathBuf;
@@ -23,6 +30,16 @@ pub struct Config {
     pub open_label: String,
     pub alt_open: Option<String>,
     pub alt_label: String,
+    pub attach: String,
+    pub stop: String,
+}
+
+/// Which configured command to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    Open,
+    Alt,
+    Attach,
 }
 
 impl Default for Config {
@@ -32,6 +49,8 @@ impl Default for Config {
             open_label: "open".into(),
             alt_open: None,
             alt_label: "alt".into(),
+            attach: "claude attach {short_id}".into(),
+            stop: "claude stop {short_id}".into(),
         }
     }
 }
@@ -68,25 +87,32 @@ impl Config {
                 "open_label" => cfg.open_label = value,
                 "alt_open" => cfg.alt_open = Some(value),
                 "alt_label" => cfg.alt_label = value,
+                "attach" => cfg.attach = value,
+                "stop" => cfg.stop = value,
                 _ => {}
             }
         }
         cfg
     }
 
-    /// The shell command for a session, `alt` selects the Alt-v command.
-    pub fn command(&self, alt: bool, session_id: &str, cwd: &str) -> Option<String> {
-        let template = if alt {
-            self.alt_open.as_deref()?
-        } else {
-            &self.open
+    /// The shell command for a session. None if Alt is not configured.
+    pub fn command(&self, which: Which, session_id: &str, cwd: &str) -> Option<String> {
+        let template = match which {
+            Which::Open => &self.open,
+            Which::Alt => self.alt_open.as_deref()?,
+            Which::Attach => &self.attach,
         };
-        Some(
-            template
-                .replace("{id}", &shell_quote(session_id))
-                .replace("{cwd}", &shell_quote(cwd)),
-        )
+        Some(render(template, session_id, cwd))
     }
+}
+
+/// Fill in `{id}`, `{short_id}` and `{cwd}` (shell-quoted).
+pub fn render(template: &str, session_id: &str, cwd: &str) -> String {
+    let short: String = session_id.chars().take(8).collect();
+    template
+        .replace("{short_id}", &shell_quote(&short))
+        .replace("{id}", &shell_quote(session_id))
+        .replace("{cwd}", &shell_quote(cwd))
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -101,23 +127,28 @@ mod tests {
     fn defaults_and_overrides() {
         let d = Config::default();
         assert_eq!(
-            d.command(false, "abc", "/w").unwrap(),
+            d.command(Which::Open, "abc", "/w").unwrap(),
             "claude --resume 'abc'"
         );
-        assert_eq!(d.command(true, "abc", "/w"), None);
+        assert_eq!(d.command(Which::Alt, "abc", "/w"), None);
 
         let c = Config::parse(
             "# comment\nopen = claude --agent a --resume {id}\nopen_label=a\n\
              alt_open = cd {cwd} && claude -r {id}\nalt_label = b\nunknown = x\nbroken line\n",
         );
+        assert_eq!(
+            d.command(Which::Attach, "5f908249-5d86-48e3", "/w")
+                .unwrap(),
+            "claude attach '5f908249'"
+        );
         assert_eq!(c.open_label, "a");
         assert_eq!(c.alt_label, "b");
         assert_eq!(
-            c.command(false, "abc", "/w").unwrap(),
+            c.command(Which::Open, "abc", "/w").unwrap(),
             "claude --agent a --resume 'abc'"
         );
         assert_eq!(
-            c.command(true, "abc", "/it's").unwrap(),
+            c.command(Which::Alt, "abc", "/it's").unwrap(),
             r"cd '/it'\''s' && claude -r 'abc'"
         );
     }

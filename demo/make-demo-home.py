@@ -8,8 +8,10 @@ Then run asf against it, so no real sessions show up:
     HOME=/tmp/asf-demo XDG_CONFIG_HOME=/tmp/asf-demo/.config \\
         XDG_CACHE_HOME=/tmp/asf-demo/.cache asf
 
-Two sessions are marked as open in a running Claude Code process. For that,
-the script starts two `sleep` processes that end after 15 minutes.
+Two sessions are marked as running: one in the background (`claude --bg`),
+one in a terminal. For that, the script starts two `sleep` processes that end
+after 15 minutes. The demo config only prints the commands asf would run, and
+its stop command ends the fake background session.
 """
 
 import json
@@ -19,13 +21,13 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 
 # (folder relative to home, branch, name, age in minutes, live status, messages)
+# Live status: None, or "<busy|idle> <bg|interactive>".
 # Messages alternate: user, assistant, user, assistant, ...
 SESSIONS = [
     (
-        "projects/webshop", "feature/checkout", "checkout-flow-refactor", 3, "busy",
+        "projects/webshop", "feature/checkout", "checkout-flow-refactor", 3, "busy bg",
         [
             "The checkout page re-renders on every keystroke. Can you find out why?",
             "The `CheckoutForm` component creates a new `useCart()` selector on every render, "
@@ -67,7 +69,7 @@ SESSIONS = [
         ],
     ),
     (
-        "projects/weather-cli", "main", "weather-cli-caching", 40, "idle",
+        "projects/weather-cli", "main", "weather-cli-caching", 40, "idle interactive",
         [
             "The weather CLI hits the API on every call. Add a cache.",
             "I added a small file cache in `~/.cache/weather-cli`. Responses are cached per "
@@ -201,15 +203,33 @@ def main():
     os.makedirs(os.path.join(claude, "sessions"))
     os.makedirs(os.path.join(home, ".config", "asf"))
     open(os.path.join(home, ".asf-demo"), "w").close()
-    with open(os.path.join(home, ".config", "asf", "config"), "w") as f:
-        f.write("open = claude --resume {id}\nopen_label = open\n")
+    asf_dir = os.path.join(home, ".config", "asf")
+    with open(os.path.join(asf_dir, "config"), "w") as f:
+        f.write(
+            "# Demo: print the commands instead of running Claude Code.\n"
+            "open = printf 'Resuming: claude --resume %s\\n' {id}\n"
+            "open_label = open\n"
+            "attach = printf 'Joining: claude attach %s\\n' {short_id}\n"
+            "stop = sh ~/.config/asf/demo-stop.sh {short_id}\n"
+        )
+    with open(os.path.join(asf_dir, "demo-stop.sh"), "w") as f:
+        f.write(
+            "# Demo stand-in for `claude stop`: end the fake session process.\n"
+            'for f in "$HOME"/.claude/sessions/*.json; do\n'
+            '  if grep -q "\\"sessionId\\":\\"$1" "$f"; then\n'
+            '    kill "$(basename "$f" .json)" 2>/dev/null\n'
+            '    rm -f "$f"\n'
+            "  fi\n"
+            "done\n"
+        )
 
     now = time.time()
     for i, (folder, branch, name, age_min, live, messages) in enumerate(SESSIONS):
         cwd = folder if folder.startswith("/") else os.path.join(home, folder) if folder else home
         if cwd.startswith(home):
             os.makedirs(cwd, exist_ok=True)
-        sid = str(uuid.UUID(int=0x5E55_0000_0000_4000_8000_0000_0000_0000 + i))
+        # Distinct first 8 characters, since `claude attach` uses those.
+        sid = f"{0x5E550A00 + i:08x}-0000-4000-8000-{i:012x}"
         project = os.path.join(claude, "projects", encode(cwd))
         os.makedirs(project, exist_ok=True)
 
@@ -240,7 +260,15 @@ def main():
 
         if live:
             pid, start = start_live_process()
-            status = {"pid": pid, "sessionId": sid, "cwd": cwd, "procStart": start, "status": live}
+            state, kind = live.split()
+            status = {
+                "pid": pid,
+                "sessionId": sid,
+                "cwd": cwd,
+                "procStart": start,
+                "status": state,
+                "kind": kind,
+            }
             with open(os.path.join(claude, "sessions", f"{pid}.json"), "w") as f:
                 f.write(dumps(status))
 

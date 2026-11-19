@@ -1,10 +1,10 @@
 # asf - Agent Session Finder
 
-Find, search and resume your past [Claude Code](https://docs.claude.com/en/docs/claude-code) conversations, in a terminal UI.
+Find, search and resume your [Claude Code](https://docs.claude.com/en/docs/claude-code) sessions in a terminal UI: past conversations as well as the ones still running.
 
 Claude Code saves every conversation in `~/.claude/projects/`, but finding an old one again means remembering its folder or scrolling through the `/resume` picker. asf turns that history into a searchable list across all your projects and drops you back into the right folder with the conversation resumed.
 
-asf works on the saved conversation history. It doesn't run or manage live agents.
+It also shows which sessions are still running. Sessions in the background (`claude --bg`, [recommended](#background-sessions-recommended)) can be joined from any terminal or stopped right from the list.
 
 ![asf demo](demo/asf.gif)
 
@@ -15,7 +15,7 @@ asf works on the saved conversation history. It doesn't run or manage live agent
 - **All sessions in one list**, newest first, or as a folder tree (`Tab`). Paths under your home are shown as `~`.
 - **Full-text search** over your questions and the agent's replies (tool output is skipped). Results are ranked: name or folder matches first, then by number of matches, then by date. The tree view only filters.
 - **Preview pane** with all your questions and the end of the conversation. While searching, it shows the conversation around each match and lets you jump between matches.
-- **No accidental double resume**: conversations that are currently open in a running Claude Code are marked (`●` busy, `○` idle), and asf asks before resuming one a second time.
+- **Ongoing sessions**: sessions that are currently running are marked (`●` busy, `○` idle). Background sessions (`claude --bg`) are joined with `claude attach` and can be stopped with `Alt-s`. For a session open in another terminal, asf asks before resuming it a second time.
 - **Session details**: number of questions and lines, and the git branch the session worked on.
 - **Rename, move and delete** sessions. Moving rewrites the session to belong to another folder.
 - **Ignore file** with gitignore-style folder patterns to hide sessions you never want to see.
@@ -80,6 +80,7 @@ Run `asf`, type to search, and press `Enter` to resume the selected session.
 | `Ctrl-r` | rename the session |
 | `Alt-m` | move the session to another folder (`Tab` completes paths) |
 | `Ctrl-d` | delete the session (asks first) |
+| `Alt-s` | stop the session, if it runs in the background (asks first if it's still working) |
 | `Alt-h` | show or hide ignored sessions |
 | `Esc` | quit |
 
@@ -90,15 +91,58 @@ Run `asf`, type to search, and press `Enter` to resume the selected session.
 By default, `Enter` runs `claude --resume <id>` in the session folder. You can change that and add a second command for `Alt-v`:
 
 ```ini
-# {id} is replaced by the session id, {cwd} by the session folder (both quoted).
+# {id} is the session id, {short_id} its first 8 characters,
+# {cwd} the session folder (all quoted).
 open = claude --resume {id}
 open_label = open
 
 alt_open = claude --model opus --resume {id}
 alt_label = opus
+
+# Enter on a conversation that is running in the background
+attach = claude attach {short_id}
+
+# Alt-s on a conversation that is running in the background
+stop = claude stop {short_id}
 ```
 
 The command runs through your shell, so `~`, environment variables and aliases defined in your shell config (with the wrapper) work.
+
+### Background sessions (recommended)
+
+A normal Claude Code session lives in the terminal it was started in: close the terminal and the session ends, and no other terminal can join it. A session started with `claude --bg` runs on its own instead:
+
+- you can join it from any terminal with `claude attach <id>` (or `Enter` in asf), and several terminals can be attached at the same time
+- `Ctrl+Z` leaves it without stopping it; `/exit` goes to Claude Code's session overview
+- it keeps working while no terminal is attached, until you stop it with `claude stop <id>` (or `Alt-s` in asf)
+
+Starting new sessions this way is recommended. `claude --bg` itself returns right away, so a small shell function that starts the session in the background and attaches to it is handy. For example, in `~/.zshrc` or `~/.bashrc`:
+
+```sh
+# Start Claude Code in the background and attach right away.
+# Arguments are passed to claude, e.g. `cbg --model opus "fix the tests"`.
+cbg() {
+  local out id
+  if out=$(claude --bg "$@" </dev/null); then
+    id=$(printf '%s\n' "$out" | sed -n 's/^backgrounded · \([0-9a-f][0-9a-f]*\).*/\1/p' | head -n 1)
+    if [ -n "$id" ]; then
+      claude attach "$id"
+      return
+    fi
+  fi
+  # Background mode failed (e.g. folder not trusted yet): start normally.
+  printf '%s\n' "$out"
+  claude "$@"
+}
+```
+
+To resume old conversations from asf in the background too, so you can pick them up from anywhere later, use an `open` command that starts them with `--bg` and attaches right away:
+
+```ini
+open = if out=$(claude --bg --resume {id} </dev/null); then claude attach {short_id}; else printf '%s\n' "$out"; claude --resume {id}; fi
+```
+
+If background mode fails (for example in a folder you haven't trusted yet), this falls back to a normal resume. Background sessions keep running until you stop them, so stop the ones you no longer need.
 
 ### Ignore file: `~/.config/asf/ignore`
 

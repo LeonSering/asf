@@ -22,24 +22,24 @@ Set Padding 20
 Set TypingSpeed 90ms
 Set Theme "TokyoNight"
 
-# Setup, not recorded: fake home, repo build on PATH, plain prompt.
+# Setup, not recorded: fake home, repo build on PATH, shell wrapper, a prompt
+# that shows the current folder.
 Hide
-Type `export HOME=/tmp/asf-demo XDG_CONFIG_HOME=/tmp/asf-demo/.config XDG_CACHE_HOME=/tmp/asf-demo/.cache PATH="$PWD/target/release:$PATH" PS1='$ '`
+Type `export HOME=/tmp/asf-demo XDG_CONFIG_HOME=/tmp/asf-demo/.config XDG_CACHE_HOME=/tmp/asf-demo/.cache PATH="$PWD/target/release:$PATH" PS1='\w $ '`
 Enter
-Type "python3 -I demo/make-demo-home.py $HOME > /dev/null && clear"
+Type "source shell/asf.sh && python3 -I demo/make-demo-home.py $HOME > /dev/null && cd ~ && clear"
 Enter
 Sleep 1s
 Show
 
 # Start asf: all sessions, newest first, with a preview of the selected one.
+# The top session runs in the background (busy), the second one in a terminal.
 Type "asf"
 Sleep 400ms
 Enter
 Sleep 3s
 
 # Browse the list.
-Down
-Sleep 900ms
 Down
 Sleep 900ms
 Down
@@ -57,25 +57,21 @@ Sleep 3s
 Ctrl+N
 Sleep 1.5s
 Ctrl+N
-Sleep 1.5s
-Ctrl+N
 Sleep 2s
 
-# Next result, its preview centers on the first match.
-Down
-Sleep 2.5s
-
-# Clear the search. The top session is open in another terminal, so asf asks first.
+# Clear the search, then stop the background session. It's still working,
+# so asf asks first.
 Backspace 5
 Sleep 1.5s
-Enter
-Sleep 2s
+Alt+S
+Sleep 2.5s
 Left
-Sleep 1s
-Right
-Sleep 1s
+Sleep 800ms
 Enter
-Sleep 1.5s
+Sleep 2.5s
 
-Escape
-Sleep 500ms
+# Find an old conversation and resume it: asf changes into its folder.
+Type "astro"
+Sleep 2.5s
+Enter
+Sleep 3.5s

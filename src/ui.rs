@@ -1,5 +1,6 @@
+use crate::config;
 use crate::index::{self, Doc, SearchResult, SessionHits, SharedIndex};
-use crate::live::{self, LiveStatus};
+use crate::live::{self, Live, LiveStatus};
 use crate::mover;
 use crate::scanner::{Role, SessionMeta};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -25,6 +26,8 @@ pub enum OpenMode {
     Primary,
     /// Alt-v: the optional `alt_open` command
     Alt,
+    /// Join a session that is running in the background (`claude --bg`)
+    Attach,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +39,8 @@ pub enum InputMode {
     ConfirmDelete,
     /// The selected session is already open in another Claude process
     ConfirmOpen(OpenMode),
+    /// Stop a background session that is still working
+    ConfirmStop,
 }
 
 /// A visible row in the list - either a directory header or a session.
@@ -75,7 +80,7 @@ pub struct App {
     search_result: Option<SearchResult>,
     sent_query: String,
     /// Sessions open in a running Claude process, refreshed every second
-    pub live: std::collections::HashMap<String, LiveStatus>,
+    pub live: std::collections::HashMap<String, Live>,
     live_checked: std::time::Instant,
     /// Selected button in a confirm dialog (false = "no", the default)
     pub confirm_yes: bool,
@@ -105,6 +110,10 @@ pub struct App {
     pub open_label: String,
     /// Footer label of the Alt-v command, None if not configured
     pub alt_label: Option<String>,
+    /// Command for Alt-s (stop a background session), None disables it
+    pub stop_template: Option<String>,
+    /// Result of a running stop command: (message, is_error)
+    stop_rx: Option<Receiver<(String, bool)>>,
     /// Move to the top result once the search for the typed query is done
     select_top_pending: bool,
     /// Alt-h: show ignored sessions (greyed out)
@@ -149,6 +158,8 @@ impl App {
             ignored,
             open_label: "open".into(),
             alt_label: None,
+            stop_template: None,
+            stop_rx: None,
             select_top_pending: false,
             show_ignored: false,
             ignored_indexed: false,
@@ -283,6 +294,14 @@ impl App {
     /// Called once per main-loop iteration: forward query changes to the
     /// search thread and apply finished search results.
     pub fn tick(&mut self) {
+        if let Some(rx) = &self.stop_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.status = Some(result);
+                self.stop_rx = None;
+                // Check right away instead of waiting for the next refresh.
+                self.live_checked -= std::time::Duration::from_secs(1);
+            }
+        }
         if self.live_checked.elapsed() >= std::time::Duration::from_secs(1) {
             self.live = live::open_sessions();
             self.live_checked = std::time::Instant::now();
@@ -403,10 +422,18 @@ impl App {
                     self.rebuild_list();
                 }
                 ListItem::Session(s, _) => {
-                    // Already open elsewhere: ask first, since two processes
+                    let live = self.live.get(&s.session_id).copied();
+                    // Running in the background: join it, any number of
+                    // terminals can be attached at the same time.
+                    if live.is_some_and(|l| l.background) {
+                        self.open_session = Some((s.clone(), OpenMode::Attach));
+                        self.should_quit = true;
+                        return;
+                    }
+                    // Open in another terminal: ask first, since two processes
                     // would append to the same session file.
                     let confirmed = self.input_mode == InputMode::ConfirmOpen(mode);
-                    if !confirmed && self.live.contains_key(&s.session_id) {
+                    if !confirmed && live.is_some() {
                         self.input_mode = InputMode::ConfirmOpen(mode);
                         self.confirm_yes = false;
                         return;
@@ -595,6 +622,62 @@ impl App {
         }
     }
 
+    /// Alt-s: stop the selected session if it runs in the background.
+    /// Idle sessions stop right away, busy ones ask first.
+    fn start_stop(&mut self) {
+        let Some(s) = self.selected_session() else {
+            return;
+        };
+        let msg = match self.live.get(&s.session_id) {
+            None => Some("This session is not running."),
+            Some(l) if !l.background => {
+                Some("This session runs in a terminal, not in the background. Exit it there.")
+            }
+            Some(l) if l.status == LiveStatus::Busy => {
+                self.input_mode = InputMode::ConfirmStop;
+                self.confirm_yes = false;
+                return;
+            }
+            Some(_) => None,
+        };
+        match msg {
+            Some(m) => self.status = Some((m.into(), true)),
+            None => self.stop_selected(),
+        }
+    }
+
+    fn stop_selected(&mut self) {
+        let (Some(s), Some(template)) = (self.selected_session(), &self.stop_template) else {
+            return;
+        };
+        let cmd = config::render(template, &s.session_id, &s.cwd);
+        let name = s.session_name.clone().unwrap_or_else(|| "unnamed".into());
+        let cwd = s.cwd.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stop_rx = Some(rx);
+        self.status = Some((format!("Stopping '{name}'..."), false));
+        // `claude stop` takes a moment; don't block the UI.
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&cwd)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let result = match out {
+                Ok(o) if o.status.success() => (format!("Stopped '{name}'."), false),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    let detail = if err.trim().is_empty() { out } else { err };
+                    (format!("Could not stop '{name}': {}", detail.trim()), true)
+                }
+                Err(e) => (format!("Could not run `{cmd}`: {e}"), true),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
     fn start_delete(&mut self) {
         if self.selected_session().is_some() {
             self.input_mode = InputMode::ConfirmDelete;
@@ -648,6 +731,15 @@ impl App {
                         Some(true) => self.confirm_delete(),
                         Some(false) => self.input_mode = InputMode::Search,
                         None => {}
+                    }
+                    return;
+                }
+                InputMode::ConfirmStop => {
+                    if let Some(yes) = self.confirm_key(key) {
+                        self.input_mode = InputMode::Search;
+                        if yes {
+                            self.stop_selected();
+                        }
                     }
                     return;
                 }
@@ -759,6 +851,10 @@ impl App {
                 self.move_up();
             }
             KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => self.start_move(),
+            // 'S' too: Alt+Shift+S, and recording tools that can't send Alt+s.
+            KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.start_stop()
+            }
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.toggle_ignored();
             }
@@ -993,6 +1089,10 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .unwrap_or("unnamed");
     let (title, question) = match app.input_mode {
         InputMode::ConfirmDelete => ("delete session", format!("Delete '{name}'?")),
+        InputMode::ConfirmStop => (
+            "session is working",
+            format!("'{name}' is still working on something. Stop it anyway?"),
+        ),
         InputMode::ConfirmOpen(_) => (
             "session already open",
             format!("'{name}' is already open in another terminal. Open anyway?"),
@@ -1011,7 +1111,7 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         };
         Span::styled(format!("[ {label} ]"), style)
     };
-    let text = vec![
+    let mut text = vec![
         Line::raw(""),
         Line::styled(question, Style::default().fg(Color::Yellow)),
         Line::raw(""),
@@ -1021,6 +1121,15 @@ fn draw_confirm_popup(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             button("no", !app.confirm_yes),
         ]),
     ];
+    if matches!(app.input_mode, InputMode::ConfirmOpen(_)) {
+        text.extend([
+            Line::raw(""),
+            Line::styled(
+                "Tip: sessions started with `claude --bg` can be joined from any terminal.",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
 
     // Up to 60 columns wide (never wider than the terminal), tall enough for the
     // wrapped question.
@@ -1092,7 +1201,10 @@ fn draw_search_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
             ]),
         ),
-        InputMode::Search | InputMode::ConfirmDelete | InputMode::ConfirmOpen(_) => (
+        InputMode::Search
+        | InputMode::ConfirmDelete
+        | InputMode::ConfirmOpen(_)
+        | InputMode::ConfirmStop => (
             bordered_block(&format!(
                 "Agent Session Finder  {count}/{total} [{mode_str}]{indexing}"
             )),
@@ -1165,7 +1277,7 @@ fn draw_session_list(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 Line::from(highlight_spans(spans, &[1], &app.search_query))
             }
             ListItem::Session(s, depth) => {
-                let live = app.live.get(&s.session_id).copied();
+                let live = app.live.get(&s.session_id).map(|l| l.status);
                 let stats = app
                     .index
                     .doc(&s.session_id)
@@ -1885,7 +1997,7 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let sep = Span::styled(" \u{2502} ", dim); // │ separator
 
     let shortcuts = match app.input_mode {
-        InputMode::ConfirmDelete | InputMode::ConfirmOpen(_) => vec![
+        InputMode::ConfirmDelete | InputMode::ConfirmOpen(_) | InputMode::ConfirmStop => vec![
             Span::styled("\u{2190}/\u{2192}", key_style),
             Span::styled(" select", dim),
             sep.clone(),
@@ -1953,6 +2065,9 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, app: &App) {
                 sep.clone(),
                 Span::styled("Alt-m", key_style),
                 Span::styled(" move", dim),
+                sep.clone(),
+                Span::styled("Alt-s", key_style),
+                Span::styled(" stop", dim),
                 sep.clone(),
                 Span::styled("Alt-h", key_style),
                 Span::styled(" ignored", dim),

@@ -19,8 +19,16 @@ pub enum LiveStatus {
     Idle,
 }
 
-/// Session id -> status of every session open in a live Claude process.
-pub fn open_sessions() -> HashMap<String, LiveStatus> {
+/// A session open in a running Claude process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Live {
+    pub status: LiveStatus,
+    /// Started with `claude --bg`: can be attached from any terminal
+    pub background: bool,
+}
+
+/// Session id -> every session open in a live Claude process.
+pub fn open_sessions() -> HashMap<String, Live> {
     let mut out = HashMap::new();
     let Some(dir) = dirs::home_dir().map(|h| h.join(".claude/sessions")) else {
         return out;
@@ -39,18 +47,19 @@ pub fn open_sessions() -> HashMap<String, LiveStatus> {
         if !is_pid_json {
             continue;
         }
-        if let Some((id, status)) = parse_status_file(&path, Path::new("/proc")) {
-            // Same session open twice: busy wins.
-            let entry = out.entry(id).or_insert(status);
-            if status == LiveStatus::Busy {
-                *entry = LiveStatus::Busy;
+        if let Some((id, live)) = parse_status_file(&path, Path::new("/proc")) {
+            // Same session open twice: busy and background win.
+            let entry = out.entry(id).or_insert(live);
+            if live.status == LiveStatus::Busy {
+                entry.status = LiveStatus::Busy;
             }
+            entry.background |= live.background;
         }
     }
     out
 }
 
-fn parse_status_file(path: &Path, proc_root: &Path) -> Option<(String, LiveStatus)> {
+fn parse_status_file(path: &Path, proc_root: &Path) -> Option<(String, Live)> {
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
     let pid = v.get("pid")?.as_u64()?;
     let id = v.get("sessionId")?.as_str()?.to_string();
@@ -62,7 +71,8 @@ fn parse_status_file(path: &Path, proc_root: &Path) -> Option<(String, LiveStatu
         Some("busy") => LiveStatus::Busy,
         _ => LiveStatus::Idle,
     };
-    Some((id, status))
+    let background = v.get("kind").and_then(|k| k.as_str()) == Some("bg");
+    Some((id, Live { status, background }))
 }
 
 /// Field 22 (starttime) of `/proc/<pid>/stat`. The command name (field 2)
@@ -96,27 +106,36 @@ mod tests {
         );
 
         let file = dir.join("42.json");
-        let write = |start: &str, status: &str| {
+        let write = |start: &str, status: &str, kind: &str| {
             fs::write(
                 &file,
                 format!(
-                    r#"{{"pid":42,"sessionId":"s1","procStart":"{start}","status":"{status}"}}"#
+                    r#"{{"pid":42,"sessionId":"s1","procStart":"{start}","status":"{status}","kind":"{kind}"}}"#
                 ),
             )
             .unwrap();
         };
-        write("22", "busy");
+        write("22", "busy", "interactive");
         assert_eq!(
             parse_status_file(&file, &dir.join("proc")),
-            Some(("s1".to_string(), LiveStatus::Busy))
+            Some((
+                "s1".to_string(),
+                Live {
+                    status: LiveStatus::Busy,
+                    background: false
+                }
+            ))
         );
-        write("22", "idle");
+        write("22", "idle", "bg");
         assert_eq!(
-            parse_status_file(&file, &dir.join("proc")).map(|(_, s)| s),
-            Some(LiveStatus::Idle)
+            parse_status_file(&file, &dir.join("proc")).map(|(_, l)| l),
+            Some(Live {
+                status: LiveStatus::Idle,
+                background: true
+            })
         );
         // PID reused by another process (different start time).
-        write("99", "busy");
+        write("99", "busy", "interactive");
         assert_eq!(parse_status_file(&file, &dir.join("proc")), None);
 
         fs::remove_dir_all(&dir).unwrap();
